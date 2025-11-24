@@ -1,0 +1,8 @@
+services:
+  liveness_failed:
+    image: ngodat0103/ops-my-pod-failed:python
+    container_name: liveness_failed
+    network_mode: host
+    build:
+      context: liveness_failed
+      dockerfile: Dockerfile
