@@ -7,15 +7,9 @@ ENV UV_LINK_MODE=copy
 ENV UV_TOOL_BIN_DIR=/usr/local/bin
 COPY pyproject.toml .
 COPY uv.lock .
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project --no-dev
-
+RUN uv sync
 COPY main.py /app/main.py
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
-ENV PATH="/app/.venv/bin:$PATH"
 RUN chown nonroot -R /app && chmod 700 -R /app
 USER nonroot
+EXPOSE 2509
 ENTRYPOINT ["/app/.venv/bin/python3", "main.py"]

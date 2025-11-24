@@ -10,10 +10,56 @@ from pathlib import Path
 import os
 import psutil
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, Response, status, HTTPException, Request
 from fastapi.responses import JSONResponse
 import uvicorn
+
+
+# Configure logging
+def setup_logging():
+    """Setup logging configuration"""
+    # Create logs directory if not exists
+    log_dir = Path("./logs")
+    log_dir.mkdir(exist_ok=True)
+
+    # Create logger
+    logger = logging.getLogger("healthcheck")
+    logger.setLevel(logging.INFO)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+
+    # File handler with rotation
+    file_handler = RotatingFileHandler(
+        log_dir / "healthcheck.log",
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # Add handlers
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+# Initialize logger
+healthcheck_logger = setup_logging()
 
 
 class FailureMode(str, Enum):
@@ -29,6 +75,7 @@ class FailureMode(str, Enum):
 
 class RealWorldErrors:
     """Simulate real-world error messages and stack traces"""
+
     @staticmethod
     def database_connection_error():
         errors = [
@@ -163,7 +210,7 @@ class PodSimulator:
 
         # Default values
         self.failure_mode = FailureMode.RANDOM_CRASH
-        self.failure_rate = 0.3
+        self.failure_rate = 0.2
         self.start_time = time.time()
         self.request_count = 0
         self.error_count = 0
@@ -343,6 +390,8 @@ app = FastAPI(
     version="1.2.5"
 )
 simulator = PodSimulator(config_file=CONFIG_FILE)
+
+
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
@@ -370,9 +419,9 @@ async def health_check(response: Response):
         # Simulate different failure modes
         if simulator.should_fail():
             simulator.error_count += 1
-
             if simulator.failure_mode == FailureMode.DATABASE_ERROR:
                 error = RealWorldErrors.database_connection_error()
+                healthcheck_logger.error(error)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail={
@@ -383,12 +432,12 @@ async def health_check(response: Response):
                         "traceback": error["traceback"]
                     }
                 )
-
             elif simulator.failure_mode == FailureMode.MEMORY_LEAK:
                 # Simulate increasing memory usage
                 simulator.memory_usage_mb += random.randint(50, 200)
                 if simulator.memory_usage_mb > 1024:  # Over 1GB
                     error = RealWorldErrors.memory_error()
+                    healthcheck_logger.error(error)
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail={
@@ -402,6 +451,7 @@ async def health_check(response: Response):
 
             elif simulator.failure_mode == FailureMode.DEPENDENCY_TIMEOUT:
                 error = RealWorldErrors.dependency_timeout()
+                healthcheck_logger.error(error)
                 await asyncio.sleep(random.randint(30, 60))
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -416,6 +466,7 @@ async def health_check(response: Response):
 
             elif simulator.failure_mode == FailureMode.CONNECTION_POOL_EXHAUSTED:
                 error = RealWorldErrors.connection_pool_exhausted()
+                healthcheck_logger.error(error)
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail={
@@ -429,6 +480,7 @@ async def health_check(response: Response):
                 )
 
             elif simulator.failure_mode == FailureMode.OOM_ERROR:
+                healthcheck_logger.error("OutOfMemoryError")
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail={
@@ -439,9 +491,9 @@ async def health_check(response: Response):
                         "timestamp": datetime.now().isoformat()
                     }
                 )
-
             elif simulator.failure_mode == FailureMode.RANDOM_CRASH:
                 error = RealWorldErrors.random_exception()
+                healthcheck_logger.error(error)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail={
@@ -451,7 +503,6 @@ async def health_check(response: Response):
                         "traceback": error["traceback"]
                     }
                 )
-
         # Healthy response
         current_memory = simulator.get_memory_usage()
         time_until_switch = simulator.get_time_until_next_switch()
@@ -502,30 +553,10 @@ async def health_check(response: Response):
                 "traceback": traceback.format_exc()
             }
         )
-@app.get("/readiness")
-async def readiness_check(response: Response):
-    """Readiness probe - checks if service can handle traffic"""
-    if simulator.failure_mode in [
-        FailureMode.DATABASE_ERROR,
-        FailureMode.CONNECTION_POOL_EXHAUSTED,
-        FailureMode.DEPENDENCY_TIMEOUT
-    ]:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {
-            "ready": False,
-            "reason": f"Service not ready: {simulator.failure_mode}",
-            "timestamp": datetime.now().isoformat()
-        }
-
-    return {
-        "ready": True,
-        "service": "order-service",
-        "timestamp": datetime.now().isoformat()
-    }
 
 
 @app.get("/liveness")
-async def liveness_check(response: Response):
+async def liveness_check(response: Response, request: Request):
     """
     Liveness probe - checks if service is alive and should be restarted
 
@@ -535,19 +566,38 @@ async def liveness_check(response: Response):
     - Critical internal error that requires restart
     - Process is in unrecoverable state
     """
+    start_time = time.time()
     simulator.request_count += 1
+
+    # Get client info
+    client_host = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
 
     try:
         # OOM Error - pod should be killed and restarted
         if simulator.failure_mode == FailureMode.OOM_ERROR:
             simulator.error_count += 1
             response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-            return {
+
+            result = {
                 "alive": False,
                 "reason": "Out of memory - requires restart",
                 "failure_mode": simulator.failure_mode.value,
                 "timestamp": datetime.now().isoformat()
             }
+
+            # Log the failure
+            healthcheck_logger.error(
+                f"LIVENESS CHECK FAILED | "
+                f"client={client_host} | "
+                f"user_agent={user_agent} | "
+                f"status=500 | "
+                f"reason=OOM | "
+                f"failure_mode={simulator.failure_mode.value} | "
+                f"response_time={time.time() - start_time:.3f}s"
+            )
+
+            return result
 
         # Memory leak reaching critical level - pod should be restarted
         if simulator.failure_mode == FailureMode.MEMORY_LEAK:
@@ -556,7 +606,8 @@ async def liveness_check(response: Response):
             if current_memory > 460 or simulator.memory_usage_mb > 1024:
                 simulator.error_count += 1
                 response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-                return {
+
+                result = {
                     "alive": False,
                     "reason": "Critical memory usage - requires restart",
                     "failure_mode": simulator.failure_mode.value,
@@ -565,23 +616,54 @@ async def liveness_check(response: Response):
                     "timestamp": datetime.now().isoformat()
                 }
 
+                # Log the failure
+                healthcheck_logger.error(
+                    f"LIVENESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=500 | "
+                    f"reason=MEMORY_CRITICAL | "
+                    f"memory_mb={round(current_memory, 2)} | "
+                    f"simulated_memory_mb={simulator.memory_usage_mb} | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
+
         # Random crash with high failure rate - simulate deadlock/hung process
         if simulator.failure_mode == FailureMode.RANDOM_CRASH:
             if simulator.should_fail() and random.random() < 0.1:  # 10% of failures are critical
                 simulator.error_count += 1
                 response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-                return {
+
+                result = {
                     "alive": False,
                     "reason": "Process in unrecoverable state - requires restart",
                     "failure_mode": simulator.failure_mode.value,
                     "timestamp": datetime.now().isoformat()
                 }
+
+                # Log the failure
+                healthcheck_logger.error(
+                    f"LIVENESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=500 | "
+                    f"reason=UNRECOVERABLE_STATE | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
+
         # Slow response causing deadlock - if delay is too long
         if simulator.failure_mode == FailureMode.SLOW_RESPONSE:
             if simulator.slow_response_delay > 30:  # More than 30s is considered hung
                 simulator.error_count += 1
                 response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-                return {
+
+                result = {
                     "alive": False,
                     "reason": "Process appears hung - requires restart",
                     "failure_mode": simulator.failure_mode.value,
@@ -589,13 +671,28 @@ async def liveness_check(response: Response):
                     "timestamp": datetime.now().isoformat()
                 }
 
+                # Log the failure
+                healthcheck_logger.error(
+                    f"LIVENESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=500 | "
+                    f"reason=PROCESS_HUNG | "
+                    f"delay_seconds={simulator.slow_response_delay} | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
+
         # Connection pool exhausted for extended period
         if simulator.failure_mode == FailureMode.CONNECTION_POOL_EXHAUSTED:
             # If this has been happening for a while, it might indicate a deadlock
             if simulator.error_count > 50 and (simulator.error_count / simulator.request_count) > 0.8:
                 simulator.error_count += 1
                 response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-                return {
+
+                result = {
                     "alive": False,
                     "reason": "Persistent connection pool exhaustion - requires restart",
                     "failure_mode": simulator.failure_mode.value,
@@ -603,12 +700,22 @@ async def liveness_check(response: Response):
                     "timestamp": datetime.now().isoformat()
                 }
 
-        # For other failure modes (DATABASE_ERROR, DEPENDENCY_TIMEOUT)
-        # These are transient issues that don't require pod restart
-        # The service is alive, just temporarily unable to serve traffic
+                # Log the failure
+                healthcheck_logger.error(
+                    f"LIVENESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=500 | "
+                    f"reason=CONNECTION_POOL_EXHAUSTED | "
+                    f"error_rate={round((simulator.error_count / simulator.request_count) * 100, 2)}% | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
 
         # Healthy response
-        return {
+        result = {
             "alive": True,
             "failure_mode": simulator.failure_mode.value,
             "uptime_seconds": int(time.time() - simulator.start_time),
@@ -616,65 +723,141 @@ async def liveness_check(response: Response):
             "timestamp": datetime.now().isoformat()
         }
 
+        # Log successful check
+        healthcheck_logger.info(
+            f"LIVENESS CHECK SUCCESS | "
+            f"client={client_host} | "
+            f"user_agent={user_agent} | "
+            f"status=200 | "
+            f"failure_mode={simulator.failure_mode.value} | "
+            f"uptime={int(time.time() - simulator.start_time)}s | "
+            f"memory_mb={round(simulator.get_memory_usage(), 2)} | "
+            f"response_time={time.time() - start_time:.3f}s"
+        )
+
+        return result
+
     except Exception as e:
         # Any unexpected exception in liveness probe is critical
         simulator.error_count += 1
         response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-        return {
+
+        result = {
             "alive": False,
             "reason": "Unexpected error in liveness probe",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
 
+        # Log the exception
+        healthcheck_logger.exception(
+            f"LIVENESS CHECK EXCEPTION | "
+            f"client={client_host} | "
+            f"user_agent={user_agent} | "
+            f"status=500 | "
+            f"error={str(e)} | "
+            f"response_time={time.time() - start_time:.3f}s"
+        )
+
+        return result
+
 
 @app.get("/readiness")
-async def readiness_check(response: Response):
+async def readiness_check(response: Response, request: Request):
     """
     Readiness probe - checks if service can handle traffic
+
     Readiness should fail when:
     - Dependencies are unavailable (database, cache, etc.)
     - Service is temporarily overloaded
     - Service is starting up or shutting down
     """
+    start_time = time.time()
     simulator.request_count += 1
+
+    # Get client info
+    client_host = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+
     try:
         # Database connection issues - not ready to serve traffic
         if simulator.failure_mode == FailureMode.DATABASE_ERROR:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {
+            result = {
                 "ready": False,
                 "reason": "Database connection unavailable",
                 "failure_mode": simulator.failure_mode.value,
                 "timestamp": datetime.now().isoformat()
             }
 
+            # Log the failure
+            healthcheck_logger.warning(
+                f"READINESS CHECK FAILED | "
+                f"client={client_host} | "
+                f"user_agent={user_agent} | "
+                f"status=503 | "
+                f"reason=DATABASE_UNAVAILABLE | "
+                f"failure_mode={simulator.failure_mode.value} | "
+                f"response_time={time.time() - start_time:.3f}s"
+            )
+
+            return result
+
         # Connection pool exhausted - not ready for more traffic
         if simulator.failure_mode == FailureMode.CONNECTION_POOL_EXHAUSTED:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {
+
+            result = {
                 "ready": False,
                 "reason": "Connection pool exhausted",
                 "failure_mode": simulator.failure_mode.value,
                 "timestamp": datetime.now().isoformat()
             }
 
+            # Log the failure
+            healthcheck_logger.warning(
+                f"READINESS CHECK FAILED | "
+                f"client={client_host} | "
+                f"user_agent={user_agent} | "
+                f"status=503 | "
+                f"reason=CONNECTION_POOL_EXHAUSTED | "
+                f"failure_mode={simulator.failure_mode.value} | "
+                f"response_time={time.time() - start_time:.3f}s"
+            )
+
+            return result
+
         # Dependency timeout - external services unavailable
         if simulator.failure_mode == FailureMode.DEPENDENCY_TIMEOUT:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {
+
+            result = {
                 "ready": False,
                 "reason": "External dependencies timeout",
                 "failure_mode": simulator.failure_mode.value,
                 "timestamp": datetime.now().isoformat()
             }
 
+            # Log the failure
+            healthcheck_logger.warning(
+                f"READINESS CHECK FAILED | "
+                f"client={client_host} | "
+                f"user_agent={user_agent} | "
+                f"status=503 | "
+                f"reason=DEPENDENCY_TIMEOUT | "
+                f"failure_mode={simulator.failure_mode.value} | "
+                f"response_time={time.time() - start_time:.3f}s"
+            )
+
+            return result
+
         # Memory leak approaching critical level - stop accepting new traffic
         if simulator.failure_mode == FailureMode.MEMORY_LEAK:
             current_memory = simulator.get_memory_usage()
             if current_memory > 400 or simulator.memory_usage_mb > 900:
                 response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-                return {
+
+                result = {
                     "ready": False,
                     "reason": "High memory usage - not accepting new traffic",
                     "failure_mode": simulator.failure_mode.value,
@@ -682,11 +865,26 @@ async def readiness_check(response: Response):
                     "timestamp": datetime.now().isoformat()
                 }
 
+                # Log the failure
+                healthcheck_logger.warning(
+                    f"READINESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=503 | "
+                    f"reason=HIGH_MEMORY | "
+                    f"memory_mb={round(current_memory, 2)} | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
+
         # Slow response - service is overloaded
         if simulator.failure_mode == FailureMode.SLOW_RESPONSE:
             if simulator.slow_response_delay > 10:
                 response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-                return {
+
+                result = {
                     "ready": False,
                     "reason": "Service overloaded - slow response times",
                     "failure_mode": simulator.failure_mode.value,
@@ -694,15 +892,43 @@ async def readiness_check(response: Response):
                     "timestamp": datetime.now().isoformat()
                 }
 
+                # Log the failure
+                healthcheck_logger.warning(
+                    f"READINESS CHECK FAILED | "
+                    f"client={client_host} | "
+                    f"user_agent={user_agent} | "
+                    f"status=503 | "
+                    f"reason=SERVICE_OVERLOADED | "
+                    f"delay_seconds={simulator.slow_response_delay} | "
+                    f"failure_mode={simulator.failure_mode.value} | "
+                    f"response_time={time.time() - start_time:.3f}s"
+                )
+
+                return result
+
         # OOM Error - definitely not ready
         if simulator.failure_mode == FailureMode.OOM_ERROR:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {
+
+            result = {
                 "ready": False,
                 "reason": "Out of memory",
                 "failure_mode": simulator.failure_mode.value,
                 "timestamp": datetime.now().isoformat()
             }
+
+            # Log the failure
+            healthcheck_logger.warning(
+                f"READINESS CHECK FAILED | "
+                f"client={client_host} | "
+                f"user_agent={user_agent} | "
+                f"status=503 | "
+                f"reason=OOM | "
+                f"failure_mode={simulator.failure_mode.value} | "
+                f"response_time={time.time() - start_time:.3f}s"
+            )
+
+            return result
 
         # Random crash with high error rate - temporarily not ready
         if simulator.failure_mode == FailureMode.RANDOM_CRASH:
@@ -710,30 +936,73 @@ async def readiness_check(response: Response):
                 error_rate = simulator.error_count / simulator.request_count
                 if error_rate > 0.5:  # More than 50% errors
                     response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-                    return {
+
+                    result = {
                         "ready": False,
                         "reason": "High error rate - temporarily not ready",
                         "failure_mode": simulator.failure_mode.value,
                         "error_rate": round(error_rate * 100, 2),
                         "timestamp": datetime.now().isoformat()
                     }
+
+                    # Log the failure
+                    healthcheck_logger.warning(
+                        f"READINESS CHECK FAILED | "
+                        f"client={client_host} | "
+                        f"user_agent={user_agent} | "
+                        f"status=503 | "
+                        f"reason=HIGH_ERROR_RATE | "
+                        f"error_rate={round(error_rate * 100, 2)}% | "
+                        f"failure_mode={simulator.failure_mode.value} | "
+                        f"response_time={time.time() - start_time:.3f}s"
+                    )
+
+                    return result
+
         # Service is ready
-        return {
+        result = {
             "ready": True,
             "service": "order-service",
             "failure_mode": simulator.failure_mode.value,
             "timestamp": datetime.now().isoformat()
         }
 
+        # Log successful check
+        healthcheck_logger.info(
+            f"READINESS CHECK SUCCESS | "
+            f"client={client_host} | "
+            f"user_agent={user_agent} | "
+            f"status=200 | "
+            f"failure_mode={simulator.failure_mode.value} | "
+            f"response_time={time.time() - start_time:.3f}s"
+        )
+
+        return result
+
     except Exception as e:
         # Unexpected errors make service not ready
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {
+
+        result = {
             "ready": False,
             "reason": "Unexpected error in readiness probe",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+        # Log the exception
+        healthcheck_logger.exception(
+            f"READINESS CHECK EXCEPTION | "
+            f"client={client_host} | "
+            f"user_agent={user_agent} | "
+            f"status=503 | "
+            f"error={str(e)} | "
+            f"response_time={time.time() - start_time:.3f}s"
+        )
+
+        return result
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus-style metrics endpoint"""
@@ -1028,6 +1297,8 @@ async def root():
             }
         }
     }
+
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
